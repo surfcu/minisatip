@@ -23,6 +23,10 @@
 #include "socketworks.h"
 #include "utils.h"
 #include "utils/testing.h"
+
+// Not declared in any header (only has external linkage within pmt.cpp's
+// translation unit), needed directly by the duplicate-SID tests below.
+extern void start_active_pmts(adapter *ad);
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -402,22 +406,133 @@ int test_duplicate_sid_master_election() {
     process_pmt(filter_a, section_a, len_a, NULL);
     SPMT *pmt_a = (SPMT *)get_filter(filter_a)->opaque;
     ASSERT(pmt_a != NULL, "PMT A was not created");
-    ASSERT_EQUAL(pmt_a->master_pmt, pmt_a->id,
-                 "PMT A should start as its own master");
 
     // Now discover the sibling the client actually subscribed to.
     process_pmt(filter_b, section_b, len_b, NULL);
     SPMT *pmt_b = (SPMT *)get_filter(filter_b)->opaque;
     ASSERT(pmt_b != NULL, "PMT B was not created");
 
-    // PMT B must win the election, because the client's subscription
-    // includes PMT_PID_B itself -- and PMT A must defer to it, so
-    // start_active_pmts() doesn't try to run both siblings concurrently.
-    ASSERT_EQUAL(pmt_b->master_pmt, pmt_b->id,
-                 "PMT B (the one the client asked for) should be its own "
-                 "master");
-    ASSERT_EQUAL(pmt_a->master_pmt, pmt_b->id,
-                 "PMT A (the undesired sibling) should defer to PMT B");
+    // PMT B must be the one actually running, because the client's
+    // subscription includes PMT_PID_B itself -- and PMT A must not run
+    // concurrently with it. This is checked via start_active_pmts()'s
+    // observable effect (PMT state), not via the static master_pmt field:
+    // the real decision is made dynamically on every call, not frozen at
+    // discovery time (see test_duplicate_sid_master_election_second_tune
+    // for why that distinction matters).
+    start_active_pmts(&ad);
+    ASSERT_EQUAL(pmt_b->state, PMT_RUNNING,
+                 "PMT B (the one the client asked for) should be running");
+    ASSERT(pmt_a->state != PMT_RUNNING,
+           "PMT A (the undesired sibling) should not be running");
+
+    return 0;
+}
+
+// Reproduces catalinii's review comment on the #1129 fix (PR #1439): the
+// re-election only happens inside process_pmt()'s stream-pid loop, which is
+// gated by `if (pmt->version == ver) return 0;` -- so it only runs on a
+// FRESH content parse (first discovery, or a genuine broadcaster version
+// bump). A client tuning a SECOND time to the sibling that lost the first
+// election does not cause the broadcaster's PMT content/version to change,
+// so process_pmt() never re-executes for either sibling, and the stale
+// master from the first tune is never reconsidered -- regardless of which
+// sibling the second tune actually subscribes to. This test simulates that
+// second tune (pid subscriptions change, no new section arrives) and checks
+// whether the correct sibling is the one start_active_pmts() would run.
+int test_duplicate_sid_master_election_second_tune() {
+    for (int i = 0; i < MAX_PMT; i++)
+        pmts[i] = nullptr;
+
+    adapter ad = {};
+    a[0] = &ad;
+    ad.id = 0;
+    ad.enabled = 1;
+
+    const int VPID = 4942, APID = 5042;
+    const int SID_A = 100, PMT_PID_A = 66;
+    const int SID_B = 200, PMT_PID_B = 67;
+
+    // --- First tune: client wants PMT A ---
+    mark_pid_add(PID_STREAM_ID_UNDEFINED, ad.id, PMT_PID_A);
+    mark_pid_add(PID_STREAM_ID_UNDEFINED, ad.id, PMT_PID_B);
+    mark_pid_add(SID_A, ad.id, PMT_PID_A);
+    mark_pid_add(SID_A, ad.id, VPID);
+    mark_pid_add(SID_A, ad.id, APID);
+    update_pids(ad.id);
+
+    auto build_pmt = [&](uint8_t *b, int sid, int pcr_pid, int version) {
+        b[0] = 0x02;
+        b[3] = sid >> 8;
+        b[4] = sid & 0xFF;
+        b[5] = 0xC1 | ((version & 0x1F) << 1);
+        b[6] = 0;
+        b[7] = 0;
+        b[8] = 0xE0 | (pcr_pid >> 8);
+        b[9] = pcr_pid & 0xFF;
+        b[10] = 0xF0;
+        b[11] = 0x00;
+        int i = 12;
+        b[i++] = 2;
+        b[i++] = 0xE0 | (VPID >> 8);
+        b[i++] = VPID & 0xFF;
+        b[i++] = 0xF0;
+        b[i++] = 0x00;
+        b[i++] = 3;
+        b[i++] = 0xE0 | (APID >> 8);
+        b[i++] = APID & 0xFF;
+        b[i++] = 0xF0;
+        b[i++] = 0x00;
+        b[i++] = 0;
+        b[i++] = 0;
+        b[i++] = 0;
+        b[i++] = 0;
+        int total_len = i;
+        int pmt_len = total_len - 3;
+        b[1] = 0xF0 | (pmt_len >> 8);
+        b[2] = pmt_len & 0xFF;
+        return total_len;
+    };
+
+    uint8_t section_a[32] = {};
+    uint8_t section_b[32] = {};
+    int len_a = build_pmt(section_a, SID_A, VPID, 0);
+    int len_b = build_pmt(section_b, SID_B, VPID, 0);
+
+    int filter_a = add_filter(ad.id, PMT_PID_A, (void *)process_pmt, NULL,
+                               FILTER_ADD_REMOVE | FILTER_CRC);
+    int filter_b = add_filter(ad.id, PMT_PID_B, (void *)process_pmt, NULL,
+                               FILTER_ADD_REMOVE | FILTER_CRC);
+
+    // Client tunes to A first; the scanner also discovers B in the
+    // background (no real client sid on B yet).
+    process_pmt(filter_a, section_a, len_a, NULL);
+    SPMT *pmt_a = (SPMT *)get_filter(filter_a)->opaque;
+    process_pmt(filter_b, section_b, len_b, NULL);
+    SPMT *pmt_b = (SPMT *)get_filter(filter_b)->opaque;
+
+    ASSERT(pmt_a && pmt_b, "PMTs were not created");
+
+    start_active_pmts(&ad);
+    ASSERT_EQUAL(pmt_a->state, PMT_RUNNING,
+                 "sanity check: PMT A should be running after the first "
+                 "tune");
+
+    // --- Second tune: client now wants PMT B instead. No new PMT section
+    // ever arrives (the broadcaster's content/version hasn't changed), only
+    // the pid subscriptions change -- exactly as catalinii described. ---
+    mark_pid_deleted(ad.id, SID_A, PMT_PID_A, NULL);
+    mark_pid_add(SID_B, ad.id, PMT_PID_B);
+    update_pids(ad.id);
+
+    start_active_pmts(&ad);
+
+    // This is the bug: without a fresh process_pmt() call, master_pmt is
+    // never re-evaluated, so PMT A is still considered the master and PMT B
+    // is never started, even though the client now specifically wants B.
+    ASSERT_EQUAL(pmt_b->state, PMT_RUNNING,
+                 "PMT B should be running after the second tune");
+    ASSERT(pmt_a->state != PMT_RUNNING,
+           "PMT A should no longer be running after the second tune");
 
     return 0;
 }
@@ -478,6 +593,9 @@ int main() {
               "testing test_emulate_add_all_pids failed")
     TEST_FUNC(test_duplicate_sid_master_election(),
               "testing duplicate-SID master PMT election (issue #1129)")
+    TEST_FUNC(test_duplicate_sid_master_election_second_tune(),
+              "testing duplicate-SID master PMT re-election on a second "
+              "tune (catalinii's #1439 review comment)")
     fflush(stdout);
     return 0;
 }

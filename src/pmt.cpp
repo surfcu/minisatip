@@ -53,6 +53,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 
 #define DEFAULT_LOG LOG_PMT
@@ -1015,6 +1016,53 @@ void start_active_pmts(adapter *ad) {
         if (ad->pids[i].flags == PID_STATE_ACTIVE) {
             pids[ad->pids[i].pid] = ad->pids + i;
         }
+
+    // For every stream pid shared by more than one PMT (duplicate-SID
+    // siblings), work out which sibling the CURRENT client subscription
+    // actually wants, recomputed on every call rather than relying on the
+    // static master_pmt field set once at PMT-discovery time. This is what
+    // makes a second/later tune to a different sibling in the same group
+    // resolve correctly even when the broadcaster's PMT content (and hence
+    // its version, and hence whether process_pmt() ever re-parses it) never
+    // changes between the two tunes -- see the discussion on PR #1439 and
+    // the related one on #1428.
+    //
+    // Two independent signals count as "the client wants this one":
+    //   1. An explicit x_pmt=<pid> in the tune request, if the client sends
+    //      one (not all clients do -- e.g. Tvheadend's SAT>IP client does
+    //      not).
+    //   2. The PMT's own table pid being present in the client's pids=
+    //      subscription, under a real (non-scanner) sid. Any
+    //      standards-compliant SAT>IP client has to request the specific
+    //      PMT pid it wants to parse in order to track that service at all,
+    //      so this works without any client-side cooperation beyond normal
+    //      behavior.
+    // If neither signal is present for any sibling in a group this sweep
+    // (e.g. the client only ever subscribed to the shared video/audio pid,
+    // never to any sibling's own PMT pid), fall back to the pre-existing
+    // static master_pmt so behavior is unchanged from before this fix.
+    std::unordered_map<int, int> preferred_owner; // stream pid -> pmt id
+    for (i = 0; i < ad->active_pmts; i++) {
+        SPMT *pmt = get_pmt(ad->active_pmt[i]);
+        if (!pmt)
+            continue;
+        bool client_wants_this_pmt = false;
+        if (ad->tp.x_pmt.has_value() && ad->tp.x_pmt.value() == pmt->pid) {
+            client_wants_this_pmt = true;
+        } else if (SPid *client_pid = find_pid(ad->id, pmt->pid)) {
+            for (int s : client_pid->sid)
+                if (s != PID_STREAM_ID_UNDEFINED) {
+                    client_wants_this_pmt = true;
+                    break;
+                }
+        }
+        if (!client_wants_this_pmt)
+            continue;
+        for (const auto &stream_pid : pmt->stream_pids)
+            if (stream_pid.is_audio || stream_pid.is_video)
+                preferred_owner[stream_pid.pid] = pmt->id;
+    }
+
     for (i = 0; i < ad->active_pmts; i++) {
         SPMT *pmt = get_pmt(ad->active_pmt[i]);
         if (!pmt)
@@ -1024,8 +1072,12 @@ void start_active_pmts(adapter *ad) {
         int pmt_started = 0;
         for (const auto &stream_pid : pmt->stream_pids) {
             // for all audio and video streams start the PMT containing them
+            auto pref = preferred_owner.find(stream_pid.pid);
+            bool is_master_here = (pref != preferred_owner.end())
+                                       ? (pref->second == pmt->id)
+                                       : (pmt->id == pmt->master_pmt);
             if ((stream_pid.is_audio || stream_pid.is_video) &&
-                pids[stream_pid.pid] && pmt->id == pmt->master_pmt) {
+                pids[stream_pid.pid] && is_master_here) {
                 is_active = 1;
 #ifndef DISABLE_TABLES
                 if (!first) {
@@ -1953,57 +2005,8 @@ int process_pmt(int filter, unsigned char *b, int len, void *opaque) {
                                            pmt_b + i + 5, es_len);
 
         if (opmt != -1 && opmt != pmt->master_pmt) {
-            // Prefer whichever sibling the client has actually asked us to
-            // demultiplex, over whichever sibling merely happened to be
-            // parsed/discovered first. Two independent signals count as
-            // "the client wants this one":
-            //   1. An explicit x_pmt=<pid> in the tune request, if the
-            //      client sends one (not all clients do -- e.g. Tvheadend's
-            //      SAT>IP client does not).
-            //   2. The PMT's own table pid being present in the client's
-            //      pids= subscription. Any standards-compliant SAT>IP
-            //      client has to request the specific PMT pid it wants to
-            //      parse in order to track that service at all, so this
-            //      works without any client-side cooperation beyond normal
-            //      behavior -- this is what lets Tvheadend (and anything
-            //      else that doesn't know about x_pmt) still resolve
-            //      correctly.
-            // Without one of these, start_active_pmts() gates purely on
-            // pmt->id == pmt->master_pmt, so a duplicate-SID sibling is
-            // silently streamed/decrypted regardless of which SID the
-            // client actually requested (see minisatip issue #1129).
-            // find_pid() alone is not enough: under full PMT scanning, the
-            // background scanner marks every PMT pid on the transponder as
-            // active too (via mark_pid_add(PID_STREAM_ID_UNDEFINED, ...) in
-            // set_filter_flags()), regardless of whether any client actually
-            // asked for it. So a pid being "active" at all doesn't mean a
-            // real client wants it -- we specifically need at least one real
-            // (non-sentinel) sid subscribed to this PMT's own pid.
-            bool client_wants_this_pmt = false;
-            if (ad->tp.x_pmt.has_value() && ad->tp.x_pmt.value() == pmt->pid) {
-                client_wants_this_pmt = true;
-            } else if (SPid *client_pid = find_pid(ad->id, pmt->pid)) {
-                for (int s : client_pid->sid)
-                    if (s != PID_STREAM_ID_UNDEFINED) {
-                        client_wants_this_pmt = true;
-                        break;
-                    }
-            }
-            if (client_wants_this_pmt) {
-                pmt->master_pmt = pmt->id;
-                // demote the previously-elected master so start_active_pmts()
-                // doesn't end up trying to run both siblings concurrently
-                SPMT *old_master = get_pmt(opmt);
-                if (old_master && old_master->id != pmt->id)
-                    old_master->master_pmt = pmt->id;
-                LOG("PMT %d, keeping as its own master (was going to defer "
-                    "to %d) -- client is actively subscribed to this PMT's "
-                    "own pid %d",
-                    pmt->id, opmt, pmt->pid);
-            } else {
-                pmt->master_pmt = opmt;
-                LOG("PMT %d, master pmt set to %d", pmt->id, opmt);
-            }
+            pmt->master_pmt = opmt;
+            LOG("PMT %d, master pmt set to %d", pmt->id, opmt);
         }
     }
     // Add the PCR pid if it's independent
