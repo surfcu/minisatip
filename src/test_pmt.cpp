@@ -1,0 +1,483 @@
+/*
+ * Copyright (C) 2014-2020 Catalin Toda <catalinii@yahoo.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
+ * USA
+ *
+ */
+#include "ca.h"
+#include "dvb.h"
+#include "minisatip.h"
+#include "socketworks.h"
+#include "utils.h"
+#include "utils/testing.h"
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/ucontext.h>
+#include <syslog.h>
+#include <time.h>
+#include <unistd.h>
+
+#define DEFAULT_LOG LOG_PMT
+
+extern adapter *a[MAX_ADAPTERS];
+extern SFilter *filters[MAX_FILTERS];
+extern SPMT *pmts[MAX_PMT];
+
+// Forward declarations
+descriptor_t create_descriptor(const uint8_t *data);
+
+uint8_t packet[188] = {
+    0x47, 0x40, 0xff, 0x99, 0x14, 0x4c, 0x83, 0x7f, 0x46, 0xba, 0xb8, 0x12,
+    0xfb, 0x83, 0xf7, 0x50, 0x9c, 0x73, 0x55, 0xe1, 0x8a, 0x1a, 0x54, 0x66,
+    0x87, 0xb1, 0xd6, 0x04, 0x10, 0xc4, 0xa9, 0xb8, 0x53, 0x4e, 0x75, 0x11,
+    0xcd, 0xaf, 0xd7, 0x05, 0x9c, 0xea, 0x08, 0x65, 0x3b, 0x36, 0x62, 0xac,
+    0xb2, 0x2c, 0xd3, 0x42, 0xb8, 0xfd, 0x67, 0x4d, 0xbf, 0xa3, 0x04, 0x4d,
+    0x0c, 0x0b, 0xb6, 0x70, 0x3f, 0xaf, 0xcc, 0x26, 0x8c, 0xf2, 0x92, 0x7d,
+    0x64, 0x37, 0x18, 0x48, 0x0b, 0xd5, 0xd6, 0x50, 0x2c, 0x79, 0xc5, 0xd9,
+    0x30, 0xb9, 0xb5, 0x9f, 0xca, 0x12, 0x0a, 0x10, 0xf2, 0x36, 0xa2, 0x23,
+    0x3c, 0xc9, 0xb7, 0x70, 0x08, 0xfb, 0x94, 0x1d, 0x36, 0x79, 0x04, 0x5e,
+    0xe6, 0x70, 0xfa, 0xaf, 0xe4, 0x12, 0x51, 0xad, 0x53, 0xb1, 0x48, 0xb7,
+    0x25, 0x67, 0x3c, 0xf5, 0x6f, 0x47, 0xe2, 0x97, 0xe4, 0x93, 0xcb, 0x87,
+    0x4f, 0x77, 0x49, 0x7a, 0x7b, 0x7e, 0x26, 0xe0, 0xc9, 0xb4, 0x6e, 0x6a,
+    0x52, 0xb8, 0xab, 0x25, 0xbf, 0x33, 0xb9, 0x4b, 0x25, 0x39, 0x26, 0x24,
+    0xaa, 0xa6, 0x19, 0xe1, 0x3f, 0xbd, 0x33, 0x7f, 0xd9, 0xa5, 0xb4, 0x25,
+    0x44, 0xb1, 0x45, 0xee, 0xee, 0x25, 0x04, 0x47, 0xcd, 0x63, 0x81, 0x03,
+    0x15, 0x59, 0x58, 0x1d, 0x00, 0x00, 0x00, 0x00};
+uint8_t cw0[] = {0x64, 0xBB, 0x0E, 0x2D, 0x98, 0xAD, 0x8C, 0xD1};
+uint8_t cw1[] = {0x77, 0xC1, 0x1F, 0x57, 0x96, 0xFB, 0xC3, 0x54};
+uint8_t cw_invalid[] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77};
+
+extern adapter *a[MAX_ADAPTERS];
+extern SCW *cws[MAX_CW];
+
+int test_descriptor_equality() {
+    const uint8_t descr1_data[] = {0x09, 0x04, 0x0B, 0x00, 0x05, 0x73};
+    descriptor_t descr1 = create_descriptor(descr1_data);
+
+    // other type
+    const uint8_t descr2_data[] = {0x01, 0x04, 0x0B, 0x00, 0x05, 0x73};
+    descriptor_t descr2 = create_descriptor(descr2_data);
+
+    // other length
+    const uint8_t descr3_data[] = {0x09, 0x02, 0x0B, 0x00};
+    descriptor_t descr3 = create_descriptor(descr3_data);
+
+    // other data
+    const uint8_t descr4_data[] = {0x09, 0x04, 0x0B, 0x00, 0x05, 0xAB};
+    descriptor_t descr4 = create_descriptor(descr4_data);
+
+    // identical
+    const uint8_t descr5_data[] = {0x09, 0x04, 0x0B, 0x00, 0x05, 0x73};
+    descriptor_t descr5 = create_descriptor(descr5_data);
+
+    ASSERT(descr1 != descr2, "descr1 and descr2 should not match");
+    ASSERT(descr1 != descr3, "descr1 and descr3 should not match");
+    ASSERT(descr1 != descr4, "descr1 and descr4 should not match");
+    ASSERT(descr1 == descr1, "descr1 should match itself");
+    ASSERT(descr1 == descr5, "descr1 and descr5 should match");
+
+    return 0;
+}
+
+int test_descriptor_caid_capid_getters() {
+    const uint8_t descr1_data[] = {0x09, 0x04, 0x0B, 0x00, 0x05, 0x73};
+    descriptor_t descr1 = create_descriptor(descr1_data);
+
+    ASSERT(descr1.get_ca_descriptor_caid() == 0x0B00, "CAID mismatch");
+    ASSERT(descr1.get_ca_descriptor_capid() == 0x0573, "CA PID mismatch");
+
+    return 0;
+}
+
+int test_decrypt() {
+    int i, max_len = 1000;
+    opts.adapter_buffer = 188 * 1000;
+    a[0] = adapter_alloc();
+    a[0]->id = 0;
+    a[0]->pids[0].pid = 0xff;
+    a[0]->pids[0].flags = 1;
+    a[0]->pids[0].pmt = 0;
+    a[0]->enabled = 1;
+    pmt_add(0, 0, 100);
+    for (i = 0; i < max_len; i++) {
+        memcpy(a[0]->buf + i * sizeof(packet), packet, sizeof(packet));
+    }
+    a[0]->rlen = max_len * sizeof(packet);
+    init_algo();
+    uint8_t ecm = 0;
+    send_cw(0, CA_ALGO_DVBCSA, 0, cw_invalid, NULL, 25, &ecm);
+    send_cw(0, CA_ALGO_DVBCSA, 0, cw0, NULL, 25, &ecm);
+    send_cw(0, CA_ALGO_DVBCSA, 1, cw1, NULL, 25, &ecm);
+    send_cw(0, CA_ALGO_DVBCSA, 0, cw_invalid, NULL, 25, &ecm);
+
+    SPMT_batch batch[1] = {{.data = packet, .len = sizeof(packet)}};
+    ASSERT(0 != test_decrypt_packet(cws[0], batch, 1),
+           "test_decrypt_packet expected to fail");
+    ASSERT(0 == test_decrypt_packet(cws[1], batch, 1),
+           "test_decrypt_packet expected to work");
+
+    pmt_decrypt_stream(a[0]);
+    uint8_t *b = a[0]->buf + (max_len - 1) * sizeof(packet);
+    ASSERT(b[4] + b[5] + b[6] == 1, "MPEG header expected");
+    hexdump("adapter buffer ", a[0]->buf, 188);
+    free(a[0]->buf);
+    delete a[0];
+    a[0] = NULL;
+    delete pmts[0];
+    pmts[0] = NULL;
+    return 0;
+}
+
+int test_wait_pusi() {
+    int i, max_len = 3 * 188;
+    opts.adapter_buffer = 188 * 1000;
+    a[0] = adapter_alloc();
+    a[0]->id = 0;
+    a[0]->pids[0].pid = 0xff;
+    a[0]->pids[0].flags = 1;
+    a[0]->pids[0].pmt = 0;
+    a[0]->enabled = 1;
+    memset(a[0]->buf, 0, a[0]->lbuf);
+    for (i = 0; i < max_len; i += 188) {
+        uint8_t *b = a[0]->buf + i;
+        b[0] = 0x47;
+        b[1] = 0x00; // no packet start
+        b[2] = 0xFF; // pid
+        b[3] = 0xC0; // encrypted + parity 1
+    }
+    // second packet changes parity
+    a[0]->buf[1 * 188 + 3] = 0x80;
+
+    // keep the same parity
+    a[0]->buf[2 * 188 + 3] = 0x80;
+    a[0]->buf[2 * 188 + 1] |= 0x40;
+
+    ASSERT(wait_pusi(a[0], 1 * 188) == 0, "wait_pusi failed");
+    ASSERT(wait_pusi(a[0], 2 * 188) == 1, "getItem should not fail");
+    ASSERT(wait_pusi(a[0], 3 * 188) == 0, "getItem should not fail");
+    free(a[0]->buf);
+    delete a[0];
+    a[0] = NULL;
+    return 0;
+}
+
+int test_assemble_packet_adaptation() {
+    unsigned char packet[] = {
+        0x47, 0x41, 0x33, 0x3f, 0x68, 0x0,  0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x0,  0x2,  0xb0, 0x4b, 0x4,  0xdd, 0xc7, 0x0,  0x0,  0xe3, 0xef,
+        0xf0, 0x0,  0x1b, 0xe3, 0xef, 0xf0, 0x18, 0x28, 0x4,  0x64, 0x0,  0x28,
+        0x3f, 0x9,  0x4,  0x9,  0x6a, 0xe5, 0x6b, 0x9,  0x4,  0x9,  0x58, 0xe5,
+        0xcf, 0x9,  0x4,  0x6,  0xcd, 0xe6, 0x33, 0x6,  0xe4, 0x53, 0xf0, 0x1c,
+        0xa,  0x4,  0x65, 0x6e, 0x67, 0x0,  0x6a, 0x2,  0x40, 0x8,  0x9,  0x4,
+        0x9,  0x6a, 0xe5, 0x6b, 0x9,  0x4,  0x9,  0x58, 0xe5, 0xcf, 0x9,  0x4,
+        0x6,  0xcd, 0xe6, 0x33, 0xc9, 0x52, 0xa8, 0xed};
+    SFilter f;
+    f.id = 0;
+    f.flags = FILTER_CRC;
+    int data = assemble_packet(&f, packet);
+    ASSERT_EQUAL(78, data, "asemble_packet failed when using adaptation")
+    ASSERT_EQUAL(0x02, f.data[0],
+                 "asemble_packet failed when using adaptation on first byte")
+    return 0;
+}
+
+int test_assemble_packet() {
+    unsigned char packet[] = {
+        0x47, 0x46, 0x31, 0x14, 0x0,  0x80, 0x70, 0x78, 0x41, 0x0,  0x2,  0x0,
+        0x55, 0x4,  0x8,  0x40, 0x6f, 0x5a, 0x1d, 0xe8, 0x21, 0x5e, 0xda, 0x28,
+        0xab, 0xbe, 0xe4, 0xe2, 0x6f, 0x8e, 0xbb, 0x2f, 0x2,  0xa0, 0x91, 0xe6,
+        0x51, 0x81, 0xe,  0x93, 0xcf, 0xf7, 0x71, 0x56, 0x2d, 0x56, 0xf4, 0x94,
+        0xbb, 0xd0, 0x9d, 0xb3, 0x3c, 0x6f, 0xc7, 0xc3, 0x19, 0xc8, 0x38, 0xed,
+        0x1f, 0x3d, 0x26, 0x33, 0x65, 0xde, 0xb2, 0xc1, 0xf5, 0x5e, 0x1a, 0x2e,
+        0x9e, 0xa3, 0x30, 0x3,  0x3f, 0x50, 0xa9, 0xf,  0x15, 0x2,  0x86, 0xb2,
+        0x55, 0xf1, 0xbf, 0x6e, 0x6e, 0x5,  0x1,  0x9b, 0xd4, 0xc5, 0x55, 0xe3,
+        0x96, 0xeb, 0x5d, 0xd2, 0xfc, 0x23, 0xfa, 0xb1, 0xa,  0x67, 0xfe, 0x6a,
+        0xde, 0x56, 0x30, 0xee, 0x51, 0xc1, 0x96, 0x31, 0xe0, 0x8b, 0x25, 0x14,
+        0x1,  0xcb, 0xcb, 0x86, 0xbd, 0x10, 0xf6, 0xf9, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    SFilter f;
+    f.id = 0;
+    f.flags = 0;
+    int data = assemble_packet(&f, packet);
+    ASSERT_EQUAL(123, data, "asemble_packet failed without adaptation")
+    ASSERT_EQUAL(
+        0x80, f.data[0],
+        "asemble_packet failed without adaptation failed on first byte")
+    return 0;
+}
+
+int test_assemble_multi_packet() {
+    unsigned char p1[] = {
+        0x47, 0x40, 0x11, 0x12, 0x0,  0x42, 0xf1, 0x5,  0x0,  0xe8, 0xc5, 0x0,
+        0x0,  0x0,  0x1,  0xff, 0x0,  0xd2, 0xfd, 0x80, 0x12, 0x48, 0x10, 0x1,
+        0x4,  0x44, 0x49, 0x47, 0x49, 0x9,  0x46, 0x69, 0x6c, 0x6d, 0x20, 0x43,
+        0x61, 0x66, 0x65, 0x1,  0x57, 0xfd, 0x90, 0x14, 0x48, 0x12, 0x1,  0x4,
+        0x44, 0x49, 0x47, 0x49, 0xb,  0x46, 0x49, 0x4c, 0x4d, 0x20, 0x4e, 0x4f,
+        0x57, 0x20, 0x48, 0x44, 0x1,  0x72, 0xfd, 0x80, 0x12, 0x48, 0x10, 0x1,
+        0x4,  0x44, 0x49, 0x47, 0x49, 0x9,  0x41, 0x58, 0x4e, 0x20, 0x57, 0x68,
+        0x69, 0x74, 0x65, 0x1,  0x7c, 0xfd, 0x80, 0x14, 0x48, 0x12, 0x1,  0x4,
+        0x44, 0x49, 0x47, 0x49, 0xb,  0x4e, 0x69, 0x63, 0x6b, 0x65, 0x6c, 0x6f,
+        0x64, 0x65, 0x6f, 0x6e, 0x1,  0xa6, 0xfd, 0x80, 0x12, 0x48, 0x10, 0x1,
+        0x4,  0x44, 0x49, 0x47, 0x49, 0x9,  0x4e, 0x69, 0x63, 0x6b, 0x74, 0x6f,
+        0x6f, 0x6e, 0x73, 0x1,  0xcc, 0xff, 0x80, 0xe,  0x48, 0xc,  0x1,  0x4,
+        0x44, 0x49, 0x47, 0x49, 0x5,  0x4d, 0x45, 0x5a, 0x5a, 0x4f, 0x2,  0x61,
+        0xfd, 0x80, 0xc,  0x48, 0xa,  0x1,  0x4,  0x44, 0x49, 0x47, 0x49, 0x3,
+        0x43, 0x4e, 0x4e, 0x2,  0x83, 0xfd, 0x90, 0x14, 0x48, 0x12, 0x1,  0x4,
+        0x44, 0x49, 0x47, 0x49, 0xb,  0x53, 0x75, 0x70};
+    unsigned char p2[] = {
+        0x47, 0x0,  0x11, 0x11, 0x65, 0x72, 0x4f, 0x4e, 0x45, 0x20, 0x48, 0x44,
+        0x2,  0x8c, 0xfd, 0x90, 0xf,  0x48, 0xd,  0x1,  0x4,  0x44, 0x49, 0x47,
+        0x49, 0x6,  0x48, 0x42, 0x4f, 0x20, 0x48, 0x44, 0x1f, 0x18, 0xfd, 0x80,
+        0x13, 0x48, 0x11, 0x6,  0x4,  0x44, 0x49, 0x47, 0x49, 0xa,  0x53, 0x57,
+        0x20, 0x44, 0x4c, 0x20, 0x53, 0x4d, 0x49, 0x54, 0x1f, 0x4a, 0xfd, 0x80,
+        0x14, 0x48, 0x12, 0x6,  0x4,  0x44, 0x49, 0x47, 0x49, 0xb,  0x53, 0x57,
+        0x20, 0x53, 0x6d, 0x61, 0x72, 0x74, 0x44, 0x54, 0x56, 0x31, 0x62, 0xad,
+        0xf5, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    SFilter f;
+    f.id = 0;
+    f.enabled = 1;
+    f.flags = FILTER_CRC;
+    int data = assemble_packet(&f, p1);
+    ASSERT_EQUAL(data, 0,
+                 "asemble_packet expected length 0 for the first packet")
+    data = assemble_packet(&f, p2);
+    printf("Got %d from assemble_packet\n", data);
+    ASSERT_EQUAL(264, data, "asemble_packet failed for multi-packet")
+    ASSERT_EQUAL(
+        0x42, f.data[0],
+        "asemble_packet failed without adaptation failed on first byte")
+    return 0;
+}
+
+// Regression test for minisatip issue #1129: two services sharing the same
+// elementary stream pids (e.g. a public/"Ticari" duplicate-SID pair) must
+// resolve master-PMT election to whichever sibling the client actually
+// subscribed to, not to whichever sibling the scanner happened to discover
+// first. The disambiguating signal is the PMT's own table pid being present
+// in the client's pid subscription -- any SAT>IP-compliant client (including
+// Tvheadend, which does not send the minisatip-specific x_pmt= parameter)
+// must request that pid in order to demultiplex the service at all, per the
+// SAT>IP spec's requirement that the media stream object be fully defined.
+int test_duplicate_sid_master_election() {
+    // Several earlier tests in this binary assign SPMT objects with
+    // automatic storage duration directly into the global pmts[] array
+    // without clearing them afterwards. Force pmt_add() below to allocate
+    // fresh heap objects instead of possibly reusing one of those stale
+    // pointers.
+    for (int i = 0; i < MAX_PMT; i++)
+        pmts[i] = nullptr;
+
+    adapter ad = {};
+    a[0] = &ad;
+    ad.id = 0;
+    ad.enabled = 1;
+
+    // Two duplicate services on the same transponder sharing the same
+    // video/audio elementary pids, but with different SIDs and different
+    // PMT table pids -- mirrors a real-world public/"Ticari" sibling pair.
+    const int VPID = 4942, APID = 5042;
+    const int SID_A = 100, PMT_PID_A = 66; // discovered first by the scanner
+    const int SID_B = 200, PMT_PID_B = 67; // the one the client actually wants
+
+    // The background PAT-driven scanner discovers and tracks BOTH sibling
+    // PMTs' own pids under the sentinel PID_STREAM_ID_UNDEFINED, regardless
+    // of client interest -- this is what full PMT scanning does for every
+    // PMT pid on the transponder, not just ones a client asked for.
+    mark_pid_add(PID_STREAM_ID_UNDEFINED, ad.id, PMT_PID_A);
+    mark_pid_add(PID_STREAM_ID_UNDEFINED, ad.id, PMT_PID_B);
+    // The client separately subscribed to PMT_PID_B's own table pid under
+    // its real session SID, plus the shared video/audio pids -- exactly
+    // what a normal SAT>IP client request for this specific service looks
+    // like. It never asked for PMT_PID_A at all.
+    mark_pid_add(SID_B, ad.id, PMT_PID_B);
+    mark_pid_add(SID_B, ad.id, VPID);
+    mark_pid_add(SID_B, ad.id, APID);
+    update_pids(ad.id);
+
+    // Build two minimal PMT sections sharing the same video/audio pids, one
+    // per sibling SID. process_pmt() does not itself validate the trailing
+    // CRC (that happens earlier, in the filter/section-assembly layer, which
+    // calling process_pmt() directly bypasses), so the 4 trailing bytes are
+    // left as zero padding rather than a real CRC32.
+    auto build_pmt = [&](uint8_t *b, int sid, int pcr_pid, int version) {
+        b[0] = 0x02; // table_id
+        b[3] = sid >> 8;
+        b[4] = sid & 0xFF;
+        b[5] = 0xC1 | ((version & 0x1F) << 1); // version + current_next
+        b[6] = 0;                              // section_number
+        b[7] = 0;                              // last_section_number
+        b[8] = 0xE0 | (pcr_pid >> 8);
+        b[9] = pcr_pid & 0xFF;
+        b[10] = 0xF0; // program_info_length hi (=0)
+        b[11] = 0x00; // program_info_length lo
+        int i = 12;
+        b[i++] = 2; // stream_type = video
+        b[i++] = 0xE0 | (VPID >> 8);
+        b[i++] = VPID & 0xFF;
+        b[i++] = 0xF0;
+        b[i++] = 0x00;
+        b[i++] = 3; // stream_type = audio
+        b[i++] = 0xE0 | (APID >> 8);
+        b[i++] = APID & 0xFF;
+        b[i++] = 0xF0;
+        b[i++] = 0x00;
+        b[i++] = 0; // CRC placeholder (4 bytes, unchecked by process_pmt())
+        b[i++] = 0;
+        b[i++] = 0;
+        b[i++] = 0;
+        int total_len = i;
+        int pmt_len = total_len - 3; // bytes after the length field itself
+        b[1] = 0xF0 | (pmt_len >> 8);
+        b[2] = pmt_len & 0xFF;
+        return total_len;
+    };
+
+    uint8_t section_a[32] = {};
+    uint8_t section_b[32] = {};
+    int len_a = build_pmt(section_a, SID_A, VPID, 0);
+    int len_b = build_pmt(section_b, SID_B, VPID, 0);
+
+    // Use the same flags a fresh scanner discovery uses in production
+    // (see process_pat()): flags=0 tells set_filter_flags() this pid isn't
+    // "wanted" by anything else yet and promptly deletes it again, which
+    // isn't what we're simulating here.
+    int filter_a = add_filter(ad.id, PMT_PID_A, (void *)process_pmt, NULL,
+                               FILTER_ADD_REMOVE | FILTER_CRC);
+    int filter_b = add_filter(ad.id, PMT_PID_B, (void *)process_pmt, NULL,
+                               FILTER_ADD_REMOVE | FILTER_CRC);
+    ASSERT(filter_a >= 0 && filter_b >= 0, "failed to add test filters");
+
+    // Discover the sibling the client did NOT ask for first, exactly as a
+    // real scanner would if it happens to parse it before the requested one.
+    process_pmt(filter_a, section_a, len_a, NULL);
+    SPMT *pmt_a = (SPMT *)get_filter(filter_a)->opaque;
+    ASSERT(pmt_a != NULL, "PMT A was not created");
+    ASSERT_EQUAL(pmt_a->master_pmt, pmt_a->id,
+                 "PMT A should start as its own master");
+
+    // Now discover the sibling the client actually subscribed to.
+    process_pmt(filter_b, section_b, len_b, NULL);
+    SPMT *pmt_b = (SPMT *)get_filter(filter_b)->opaque;
+    ASSERT(pmt_b != NULL, "PMT B was not created");
+
+    // PMT B must win the election, because the client's subscription
+    // includes PMT_PID_B itself -- and PMT A must defer to it, so
+    // start_active_pmts() doesn't try to run both siblings concurrently.
+    ASSERT_EQUAL(pmt_b->master_pmt, pmt_b->id,
+                 "PMT B (the one the client asked for) should be its own "
+                 "master");
+    ASSERT_EQUAL(pmt_a->master_pmt, pmt_b->id,
+                 "PMT A (the undesired sibling) should defer to PMT B");
+
+    return 0;
+}
+
+int test_emulate_add_all_pids() {
+    adapter ad = {};
+    a[0] = &ad;
+    ad.enabled = 1;
+    SPMT pmt;
+    pmts[0] = &pmt;
+    pmt.enabled = 1;
+    pmt.adapter = 0;
+    opts.emulate_pids_all = 1;
+    SStreamPid sp{.type = 1, .pid = 100};
+    pmt.stream_pids.push_back(sp);
+    SStreamPid sp1{.type = 1, .pid = 101};
+    pmt.stream_pids.push_back(sp1);
+    ad.active_pmts = 1;
+    ad.active_pmt[0] = 0;
+    mark_pid_add(0, ad.id, 8192);
+    mark_pid_add(1, ad.id, 8192);
+    mark_pid_add(2, ad.id, 101);
+    update_pids(ad.id);
+    int pids[] = {100, 0, 1, 16};
+    for (auto pid : pids) {
+        SPid *p = find_pid(ad.id, pid);
+        ASSERT_EQUAL(p->pid, pid, "emulate_add_all_pids failed");
+        ASSERT_EQUAL(p->sid.count(0), 1,
+                     "emulate_add_all_pids failed to set first stream");
+        ASSERT_EQUAL(p->sid.count(1), 1,
+                     "emulate_add_all_pids failed to set second stream");
+    }
+    SPid *p = find_pid(ad.id, 101); // pid 101 should have sid 0, 1. 2
+
+    ASSERT(p->has_stream(2) && p->has_stream(0) && p->has_stream(1),
+           "Expected 3 sids to be set fo pid 101");
+    opts.emulate_pids_all = 0;
+    return 0;
+}
+
+int main() {
+    opts.log = 255;
+    opts.debug = 255;
+    strcpy(thread_info[thread_index].thread_name, "test_pmt");
+    TEST_FUNC(test_descriptor_equality(),
+              "testing descriptor equality operator");
+    TEST_FUNC(test_descriptor_caid_capid_getters(),
+              "testing descriptor getters");
+    TEST_FUNC(test_wait_pusi(), "testing decrypt");
+    TEST_FUNC(test_decrypt(), "testing decrypt");
+    TEST_FUNC(test_assemble_packet(),
+              "testing assemble_packet without adaptation");
+    TEST_FUNC(test_assemble_packet_adaptation(),
+              "testing assemble_packet with adaptation");
+    TEST_FUNC(test_assemble_multi_packet(),
+              "testing assemble_packet with multiple packets");
+    TEST_FUNC(test_emulate_add_all_pids(),
+              "testing test_emulate_add_all_pids failed")
+    TEST_FUNC(test_duplicate_sid_master_election(),
+              "testing duplicate-SID master PMT election (issue #1129)")
+    fflush(stdout);
+    return 0;
+}

@@ -1953,8 +1953,57 @@ int process_pmt(int filter, unsigned char *b, int len, void *opaque) {
                                            pmt_b + i + 5, es_len);
 
         if (opmt != -1 && opmt != pmt->master_pmt) {
-            pmt->master_pmt = opmt;
-            LOG("PMT %d, master pmt set to %d", pmt->id, opmt);
+            // Prefer whichever sibling the client has actually asked us to
+            // demultiplex, over whichever sibling merely happened to be
+            // parsed/discovered first. Two independent signals count as
+            // "the client wants this one":
+            //   1. An explicit x_pmt=<pid> in the tune request, if the
+            //      client sends one (not all clients do -- e.g. Tvheadend's
+            //      SAT>IP client does not).
+            //   2. The PMT's own table pid being present in the client's
+            //      pids= subscription. Any standards-compliant SAT>IP
+            //      client has to request the specific PMT pid it wants to
+            //      parse in order to track that service at all, so this
+            //      works without any client-side cooperation beyond normal
+            //      behavior -- this is what lets Tvheadend (and anything
+            //      else that doesn't know about x_pmt) still resolve
+            //      correctly.
+            // Without one of these, start_active_pmts() gates purely on
+            // pmt->id == pmt->master_pmt, so a duplicate-SID sibling is
+            // silently streamed/decrypted regardless of which SID the
+            // client actually requested (see minisatip issue #1129).
+            // find_pid() alone is not enough: under full PMT scanning, the
+            // background scanner marks every PMT pid on the transponder as
+            // active too (via mark_pid_add(PID_STREAM_ID_UNDEFINED, ...) in
+            // set_filter_flags()), regardless of whether any client actually
+            // asked for it. So a pid being "active" at all doesn't mean a
+            // real client wants it -- we specifically need at least one real
+            // (non-sentinel) sid subscribed to this PMT's own pid.
+            bool client_wants_this_pmt = false;
+            if (ad->tp.x_pmt.has_value() && ad->tp.x_pmt.value() == pmt->pid) {
+                client_wants_this_pmt = true;
+            } else if (SPid *client_pid = find_pid(ad->id, pmt->pid)) {
+                for (int s : client_pid->sid)
+                    if (s != PID_STREAM_ID_UNDEFINED) {
+                        client_wants_this_pmt = true;
+                        break;
+                    }
+            }
+            if (client_wants_this_pmt) {
+                pmt->master_pmt = pmt->id;
+                // demote the previously-elected master so start_active_pmts()
+                // doesn't end up trying to run both siblings concurrently
+                SPMT *old_master = get_pmt(opmt);
+                if (old_master && old_master->id != pmt->id)
+                    old_master->master_pmt = pmt->id;
+                LOG("PMT %d, keeping as its own master (was going to defer "
+                    "to %d) -- client is actively subscribed to this PMT's "
+                    "own pid %d",
+                    pmt->id, opmt, pmt->pid);
+            } else {
+                pmt->master_pmt = opmt;
+                LOG("PMT %d, master pmt set to %d", pmt->id, opmt);
+            }
         }
     }
     // Add the PCR pid if it's independent
