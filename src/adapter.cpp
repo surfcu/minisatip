@@ -1090,6 +1090,8 @@ int tune(int aid, int sid) {
         ad->status = -1;
         ad->status_cnt = 0;
         ad->wait_new_stream = 1;
+        // Reject the previous mux's PAT; read before post_tune() clears it.
+        ad->wait_transponder_id = ad->transponder_id;
         ad->strength = 0;
         ad->snr = 0;
         ad->db = MAX_DB;

@@ -164,6 +164,56 @@ int test_start_play_no_transport() {
     return 0;
 }
 
+int check_new_transponder(adapter *ad, int rlen);
+
+// Tune adapter 0 to freq as master sid 0; the previous mux had TSID tid
+static int tune_to(int freq, int tid) {
+    adapter *ad = a[0];
+    ad->master_sid = 0;
+    ad->do_tune = 1;
+    ad->tp.freq = freq;
+    ad->tp.pol = 1;
+    ad->tp.diseqc = 1;
+    ad->tp.sys = SYS_DVBS2;
+    ad->transponder_id = tid;
+    return tune(0, 0);
+}
+
+// A tune arms the stale-data gate with the TSID of the mux it leaves.
+int test_tune_seeds_stale_gate_with_previous_tsid() {
+    setup_test_env();
+    adapter *ad = a[0];
+    ad->wait_transponder_id = 40601; // stale, from two muxes back
+
+    ASSERT(tune_to(11958000, 40901) == 0, "mux change tune failed");
+    ASSERT(ad->wait_new_stream == 1, "mux change should arm the gate");
+    ASSERT(ad->wait_transponder_id == 40901,
+           "the gate should reject the previous mux's TSID");
+    return 0;
+}
+
+// The gate drops a buffered PAT of the previous mux and accepts a new one.
+int test_check_new_transponder_rejects_previous_mux() {
+    setup_test_env();
+    adapter *ad = a[0];
+    uint8_t buf[DVB_FRAME] = {0x47, 0x40, 0x00, 0x10, 0x00, 0x00, 0xB0, 0x0D};
+    ad->buf = buf;
+    ad->wait_transponder_id = 40601;
+
+    buf[8] = 40601 >> 8;
+    buf[9] = 40601 & 0xFF;
+    ASSERT(check_new_transponder(ad, DVB_FRAME) == 0,
+           "a PAT of the previous mux must be flushed");
+
+    buf[8] = 40301 >> 8;
+    buf[9] = 40301 & 0xFF;
+    ASSERT(check_new_transponder(ad, DVB_FRAME) == DVB_FRAME,
+           "a PAT of the new mux must be accepted");
+    ASSERT(ad->wait_transponder_id == 40301, "the new TSID should be kept");
+    ad->buf = nullptr;
+    return 0;
+}
+
 int test_start_play_success() {
     setup_test_env();
 
@@ -926,6 +976,10 @@ int main() {
     TEST_FUNC(test_start_play_no_transport(),
               "test start_play returns error when transport is missing");
     TEST_FUNC(test_start_play_success(), "test start_play success under HTTP");
+    TEST_FUNC(test_tune_seeds_stale_gate_with_previous_tsid(),
+              "test tune seeds the stale-data gate with the old TSID");
+    TEST_FUNC(test_check_new_transponder_rejects_previous_mux(),
+              "test the gate drops the previous mux's PAT");
     TEST_FUNC(test_setup_after_play_same_mux_keeps_adapter(),
               "test same-mux SETUP after PLAY keeps the adapter");
     TEST_FUNC(test_setup_after_play_new_mux_releases_adapter(),
