@@ -8,7 +8,7 @@
 #include <unordered_set>
 
 // Maximum number of PMTs (channels) supported per adapter
-#define MAX_CHANNELS_ON_CI 8
+#define MAX_CHANNELS_ON_CI 16
 
 #define DDCI_BUFFER (20000 * 188)
 
@@ -39,6 +39,7 @@ typedef struct ddci_mapping_table {
     std::unordered_set<int> pmt;
     int filter_id = -1;
     int pid_added = -1;
+    uint32_t bw_pkts = 0; // measure: packets fed in the current sample
 } ddci_mapping_table_t;
 
 typedef struct ddci_device {
@@ -63,6 +64,13 @@ typedef struct ddci_device {
     std::unordered_map<int, ddci_mapping_table_t> mapping;
     std::unordered_set<int> emm_pids; // MAKE_KEY(ad,pid), never swept
     SFIFO fifo;
+    // measure: 1 s samples, kbit/s; per channel slot, peak kept until rejoin
+    int64_t bw_tick = 0, bw_log_tick = 0;
+    uint64_t bw_bytes = 0;
+    uint32_t bw_tot_max = 0, bw_tot_sum = 0, bw_samples = 0;
+    int bw_ch_id[MAX_CHANNELS_ON_CI + 1];
+    uint32_t bw_ch_max[MAX_CHANNELS_ON_CI + 1], bw_ch_sum[MAX_CHANNELS_ON_CI + 1];
+    uint32_t bw_ch_n[MAX_CHANNELS_ON_CI + 1], bw_ch_peak[MAX_CHANNELS_ON_CI + 1];
 } ddci_device_t;
 
 typedef struct ddci_channel {

@@ -1034,7 +1034,7 @@ static void ddci_update_pmt_name(ddci_device_t *d, SPMT *pmt) {
 // PMT create/update/del all run on the owner adapter's thread,
 // so this tick emits only the processed adapter's channels.
 int ddci_add_psi(ddci_device_t *d, uint8_t *dst, int len, adapter *ad) {
-    unsigned char psi[1500];
+    unsigned char psi[4096]; // 16 services can push the SDT past 1500
     int64_t ctime = getTick();
     int i, pos = 0;
     int psi_len;
@@ -1139,6 +1139,65 @@ int push_ts_to_adapter(ddci_device_t *d, adapter *ad, uint16_t *mapping) {
     return 0;
 }
 
+// measure: sample the CI feed every second, log every 10 s
+static void ddci_bw_tick(ddci_device_t *d) {
+    int64_t now = getTick();
+    if (!d->bw_tick) {
+        d->bw_tick = d->bw_log_tick = now;
+        for (int i = 0; i <= MAX_CHANNELS_ON_CI; i++)
+            d->bw_ch_id[i] = -1;
+        return;
+    }
+    int64_t el = now - d->bw_tick;
+    if (el < 1000)
+        return;
+    uint32_t tot = d->bw_bytes * 8 / el; // bytes*8/ms = kbit/s
+    d->bw_tot_max = std::max(d->bw_tot_max, tot);
+    d->bw_tot_sum += tot;
+    d->bw_samples++;
+    for (int i = 0; i < d->max_channels; i++) {
+        int id = d->pmt[i].id;
+        if (id < 0)
+            continue;
+        if (d->bw_ch_id[i] != id) {
+            d->bw_ch_id[i] = id;
+            d->bw_ch_peak[i] = 0;
+            d->bw_ch_max[i] = d->bw_ch_sum[i] = d->bw_ch_n[i] = 0;
+        }
+        uint64_t pk = 0;
+        for (const auto &[key, m] : d->mapping)
+            if (m.rewrite && m.pmt.count(id))
+                pk += m.bw_pkts;
+        uint32_t kb = pk * 188 * 8 / el;
+        d->bw_ch_max[i] = std::max(d->bw_ch_max[i], kb);
+        d->bw_ch_peak[i] = std::max(d->bw_ch_peak[i], kb);
+        d->bw_ch_sum[i] += kb;
+        d->bw_ch_n[i]++;
+    }
+    for (auto &[key, m] : d->mapping)
+        m.bw_pkts = 0;
+    d->bw_bytes = 0;
+    d->bw_tick = now;
+    if (now - d->bw_log_tick < 10000)
+        return;
+    LOG("DDCI_BW ddci=%d channels=%d total_avg=%.2f total_max=%.2f", d->id,
+        d->channels, d->bw_tot_sum / 1000.0 / d->bw_samples,
+        d->bw_tot_max / 1000.0);
+    for (int i = 0; i < d->max_channels; i++) {
+        SPMT *pmt = get_pmt(d->pmt[i].id);
+        if (!pmt || d->bw_ch_id[i] != d->pmt[i].id || !d->bw_ch_n[i])
+            continue;
+        LOG("DDCI_BW_CH ddci=%d slot=%d ad=%d sid=%d pmt=%d avg=%.2f max=%.2f "
+            "peak=%.2f",
+            d->id, i, pmt->adapter, pmt->sid, pmt->id,
+            d->bw_ch_sum[i] / 1000.0 / d->bw_ch_n[i], d->bw_ch_max[i] / 1000.0,
+            d->bw_ch_peak[i] / 1000.0);
+        d->bw_ch_max[i] = d->bw_ch_sum[i] = d->bw_ch_n[i] = 0;
+    }
+    d->bw_tot_max = d->bw_tot_sum = d->bw_samples = 0;
+    d->bw_log_tick = now;
+}
+
 int ddci_process_ts(adapter *ad, ddci_device_t *d) {
     unsigned char *b;
     adapter *ad2 = get_adapter(d->id);
@@ -1149,7 +1208,7 @@ int ddci_process_ts(adapter *ad, ddci_device_t *d) {
     struct iovec io[iomax];
     unsigned char psi[MAX_CHANNELS_ON_CI * 1500];
     unsigned char null_tail[DVB_FRAME];
-    uint16_t ad_dd_pids[8192], dd_ad_pids[8192];
+    uint16_t ad_dd_pids[8192], dd_ad_pids[8192], bw_cnt[8192];
 
     std::lock_guard<SMutex> lock(d->mutex);
     if (!d->enabled) {
@@ -1173,8 +1232,10 @@ int ddci_process_ts(adapter *ad, ddci_device_t *d) {
 
     if (ec == 0) {
         d->read_index[ad->id] = 0;
+        ddci_bw_tick(d);
         return 0;
     }
+    memset(bw_cnt, 0, sizeof(bw_cnt));
     // Reset to write index to prevent reading old data from the FIFO
     if (d->read_index[ad->id] == 0)
         d->read_index[ad->id] = d->fifo.write_index;
@@ -1189,6 +1250,7 @@ int ddci_process_ts(adapter *ad, ddci_device_t *d) {
         dpid = ad_dd_pids[pid];
         if (dpid == 0)
             continue;
+        bw_cnt[pid]++;
 
         dump_packets("ddci_process_ts -> DD", b, 188, i);
 
@@ -1231,6 +1293,8 @@ int ddci_process_ts(adapter *ad, ddci_device_t *d) {
         DEBUGM("writing %d bytes to DDCI device %d, fd %d, sock %d", bytes,
                d->id, ad2->fe, ad2->fe_sock);
         int rb = writev(ad2->fe, io, iop);
+        if (rb > 0)
+            d->bw_bytes += rb;
         if (rb != bytes)
             LOG("%s: write incomplete to DDCI %d,fd %d, wrote %d out of %d "
                 "(iop %d%s), "
@@ -1245,6 +1309,11 @@ int ddci_process_ts(adapter *ad, ddci_device_t *d) {
         for (j = 0; j < io[i].iov_len; j += 188)
             set_pid_ts((uint8_t *)io[i].iov_base + j, 0x1FFF);
     }
+
+    for (auto &[key, m] : d->mapping)
+        if (m.ad == ad->id && m.rewrite)
+            m.bw_pkts += bw_cnt[m.pid];
+    ddci_bw_tick(d);
 
     // move back TS packets from the DDCI out buffer to the adapter buffer
     push_ts_to_adapter(d, ad, dd_ad_pids);

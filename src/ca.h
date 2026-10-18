@@ -119,7 +119,7 @@
 #define CA_STATE_INITIALIZED 2
 
 // Programs one CAPMT can carry: the first one plus packed partners
-#define MAX_PMT_PER_CAPMT 3
+#define MAX_PMT_PER_CAPMT 16
 // Largest stream loop of one program kept for a lazy leave
 #define CAPMT_KEPT_ES_MAX 1024
 
